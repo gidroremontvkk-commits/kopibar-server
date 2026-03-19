@@ -9,6 +9,7 @@ const cors    = require('cors');
 const https   = require('https');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const CACHE_FILE = path.join(__dirname, 'klines-cache.json');
 
@@ -73,22 +74,30 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function httpGet(hostname, path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname, path, method: 'GET', agent,
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip' } },
+      { hostname, path, method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate' } },
       (res) => {
-        // ����� ������ ��� ������ ����� retry ��� ��� ������
-        const status = res.statusCode;
-        let body = '';
-        res.on('data', c => body += c);
+        let chunks = [];
+        res.on('data', c => chunks.push(c));
         res.on('end', () => {
-          if (status === 429 || status === 418) {
-            return reject(Object.assign(new Error('RateLimit'), { status }));
+          const buf = Buffer.concat(chunks);
+          const encoding = res.headers['content-encoding'];
+          const decode = (data) => {
+            try { return JSON.parse(data); }
+            catch (e) { reject(new Error('JSON parse: ' + data.toString().slice(0, 100))); }
+          };
+          if (encoding === 'gzip') {
+            zlib.gunzip(buf, (err, decoded) => {
+              if (err) return reject(err);
+              resolve(decode(decoded.toString()));
+            });
+          } else if (encoding === 'deflate') {
+            zlib.inflate(buf, (err, decoded) => {
+              if (err) return reject(err);
+              resolve(decode(decoded.toString()));
+            });
+          } else {
+            resolve(decode(buf.toString()));
           }
-          if (status >= 400) {
-            return reject(Object.assign(new Error(`HTTP ${status}`), { status }));
-          }
-          try { resolve(JSON.parse(body)); }
-          catch (e) { reject(new Error('JSON parse: ' + body.slice(0, 120))); }
         });
       }
     );
@@ -518,7 +527,7 @@ app.get('/klines', async (req, res) => {
   if (!symbol)              return res.status(400).json({ error: '����� symbol' });
   if (!EXCHANGES[exchange]) return res.status(400).json({ error: '����������� �����' });
 
-  const cached = getCached(exchange, symbol, interval);
+  const cached = getCache(exchange, symbol, interval);
 
   // ��� ������ � ����� �����
   if (!needsRefresh(cached, interval)) {
