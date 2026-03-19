@@ -7,6 +7,32 @@
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
+const fs = require('fs');
+const path = require('path');
+
+const CACHE_FILE = path.join(__dirname, 'klines-cache.json');
+
+// Загружаем кэш с диска при старте
+let diskCache = {};
+try {
+  if (fs.existsSync(CACHE_FILE)) {
+    diskCache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    console.log(`Загружен кэш с диска: ${Object.keys(diskCache).length} записей`);
+  }
+} catch(e) {
+  console.log('Кэш с диска не загружен:', e.message);
+  diskCache = {};
+}
+
+// Сохраняем кэш на диск раз в 5 минут
+setInterval(() => {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(diskCache), 'utf8');
+    console.log(`Кэш сохранён на диск: ${Object.keys(diskCache).length} записей`);
+  } catch(e) {
+    console.log('Ошибка сохранения кэша:', e.message);
+  }
+}, 5 * 60 * 1000);
 
 const app  = express();
 const PORT = 3001;
@@ -147,14 +173,16 @@ const Binance = {
   host: 'fapi.binance.com',
 
   async getSymbols() {
-    const d = await fetchWithRetry('binance', this.host, '/fapi/v1/exchangeInfo');
+    const d = await httpGet('fapi.binance.com', '/fapi/v1/exchangeInfo');
+    if (!d || !Array.isArray(d.symbols)) return [];
     return d.symbols
       .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
       .map(s => s.symbol);
   },
 
   async getTickers() {
-    const d = await fetchWithRetry('binance', this.host, '/fapi/v1/ticker/24hr');
+    const d = await httpGet('fapi.binance.com', '/fapi/v1/ticker/24hr');
+    if (!Array.isArray(d)) return [];
     return d.map(t => ({
       symbol: t.symbol,
       price: parseFloat(t.lastPrice),
@@ -171,6 +199,7 @@ const Binance = {
     let qs = `symbol=${symbol}&interval=${tf}&limit=${limit}`;
     if (endTime) qs += `&endTime=${endTime}`;
     const d = await fetchWithRetry('binance', this.host, `/fapi/v1/klines?${qs}`);
+    if (!Array.isArray(d)) return [];
     return d.map(c => ({
       time: c[0]/1000, open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5], openTime:c[0]
     }));
@@ -346,15 +375,25 @@ const REFRESH_TTL = {
   '1h': 120_000,  '4h': 180_000, '1d': 300_000,
 };
 
-function getCached(exchange, symbol, interval) {
-  return kCache[exchange]?.[symbol]?.[interval] || null;
+function getCache(exchange, symbol, interval) {
+  // Сначала смотрим в RAM
+  const ram = cache[exchange]?.[symbol]?.[interval] || null;
+  if (ram) return ram;
+  // Потом смотрим на диске
+  const key = `${exchange}:${symbol}:${interval}`;
+  const disk = diskCache[key];
+  if (disk) return disk;
+  return null;
 }
 
-function setCached(exchange, symbol, interval, candles) {
-  if (!kCache[exchange]) kCache[exchange] = {};
-  if (!kCache[exchange][symbol]) kCache[exchange][symbol] = {};
-  const lastOpenTime = candles.length ? candles[candles.length - 1].openTime : 0;
-  kCache[exchange][symbol][interval] = { candles, lastOpenTime, updatedAt: Date.now() };
+function setCache(exchange, symbol, interval, data) {
+  // Пишем в RAM
+  if (!cache[exchange]) cache[exchange] = {};
+  if (!cache[exchange][symbol]) cache[exchange][symbol] = {};
+  cache[exchange][symbol][interval] = { data, updatedAt: Date.now() };
+  // Пишем на диск
+  const key = `${exchange}:${symbol}:${interval}`;
+  diskCache[key] = { data, updatedAt: Date.now() };
 }
 
 function needsRefresh(cached, interval) {
