@@ -49,15 +49,15 @@ const limiterGeneral = rateLimit({
   max: 120,            // не более 120 запросов в минуту с одного IP
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Слишком много запросов, подожди минуту' }
+  handler: (req, res) => res.status(429).json({ error: 'Слишком много запросов, подожди минуту' })
 });
 
 const limiterKlines = rateLimit({
   windowMs: 60 * 1000, // 1 минута
-  max: 60,             // для тяжёлых запросов свечей — не более 60
+  max: 600,             // для тяжёлых запросов свечей — не более 600
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Слишком много запросов свечей, подожди минуту' }
+  handler: (req, res) => res.status(429).json({ error: 'Слишком много запросов свечей, подожди минуту' })
 });
 
 app.use('/ping',    limiterGeneral);
