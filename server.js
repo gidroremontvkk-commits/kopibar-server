@@ -28,7 +28,7 @@ try {
 // Сохраняем кэш на диск раз в 5 минут
 setInterval(() => {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(diskCache), 'utf8');
+    const keys = Object.keys(diskCache); const recent = keys.slice(-100).reduce((o,k) => { o[k]=diskCache[k]; return o; }, {}); fs.writeFileSync(CACHE_FILE, JSON.stringify(recent), 'utf8');
     console.log(`Кэш сохранён на диск: ${Object.keys(diskCache).length} записей`);
   } catch(e) {
     console.log('Ошибка сохранения кэша:', e.message);
@@ -184,7 +184,7 @@ const Binance = {
   async getSymbols() {
     const d = await httpGet('fapi.binance.com', '/fapi/v1/exchangeInfo');
     if (!d || !Array.isArray(d.symbols)) return [];
-    return d.symbols
+    return d.symbols.filter(s => /^[A-Z0-9]+$/.test(s.symbol)).filter(s => /^[A-Z0-9]+$/.test(s.symbol))
       .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
       .map(s => s.symbol);
   },
@@ -386,7 +386,7 @@ const REFRESH_TTL = {
 
 function getCache(exchange, symbol, interval) {
   // Сначала смотрим в RAM
-  const ram = cache[exchange]?.[symbol]?.[interval] || null;
+  const ram = kCache[exchange]?.[symbol]?.[interval] || null;
   if (ram) return ram;
   // Потом смотрим на диске
   const key = `${exchange}:${symbol}:${interval}`;
@@ -397,12 +397,12 @@ function getCache(exchange, symbol, interval) {
 
 function setCache(exchange, symbol, interval, data) {
   // Пишем в RAM
-  if (!cache[exchange]) cache[exchange] = {};
-  if (!cache[exchange][symbol]) cache[exchange][symbol] = {};
-  cache[exchange][symbol][interval] = { data, updatedAt: Date.now() };
+  if (!kCache[exchange]) kCache[exchange] = {};
+  if (!kCache[exchange][symbol]) kCache[exchange][symbol] = {};
+  kCache[exchange][symbol][interval] = { candles: data, updatedAt: Date.now() };
   // Пишем на диск
   const key = `${exchange}:${symbol}:${interval}`;
-  diskCache[key] = { data, updatedAt: Date.now() };
+  diskCache[key] = { candles: data, updatedAt: Date.now() };
 }
 
 function needsRefresh(cached, interval) {
@@ -545,7 +545,7 @@ app.get('/klines', async (req, res) => {
       // ���������� � ������ ����� �����
       candles = await dedupe(key, () => refreshCache(exchange, symbol, interval, cached));
     }
-    setCached(exchange, symbol, interval, candles);
+    setCache(exchange, symbol, interval, candles);
     res.json(candles);
   } catch (e) {
     console.error(`[/klines] ${exchange} ${symbol} ${interval}:`, e.message);
