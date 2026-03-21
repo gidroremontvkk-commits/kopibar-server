@@ -1,39 +1,15 @@
 /**
- * KopiBar � ������-������ ��� 5 ����
- * Binance, Bybit, OKX, Gate.io, Bitget
- * ������: node server.js
+ * KopiBar Server v2.0
+ * SQLite хранилище + полная история Binance + автообновление
  */
 
-const express = require('express');
-const cors    = require('cors');
-const https   = require('https');
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-
-const CACHE_FILE = path.join(__dirname, 'klines-cache.json');
-
-// Загружаем кэш с диска при старте
-let diskCache = {};
-try {
-  if (fs.existsSync(CACHE_FILE)) {
-    diskCache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    console.log(`Загружен кэш с диска: ${Object.keys(diskCache).length} записей`);
-  }
-} catch(e) {
-  console.log('Кэш с диска не загружен:', e.message);
-  diskCache = {};
-}
-
-// Сохраняем кэш на диск раз в 5 минут
-setInterval(() => {
-  try {
-    const keys = Object.keys(diskCache); const recent = keys.slice(-100).reduce((o,k) => { o[k]=diskCache[k]; return o; }, {}); fs.writeFileSync(CACHE_FILE, JSON.stringify(recent), 'utf8');
-    console.log(`Кэш сохранён на диск: ${Object.keys(diskCache).length} записей`);
-  } catch(e) {
-    console.log('Ошибка сохранения кэша:', e.message);
-  }
-}, 5 * 60 * 1000);
+const express  = require('express');
+const cors     = require('cors');
+const https    = require('https');
+const zlib     = require('zlib');
+const path     = require('path');
+const fs       = require('fs');
+const Database = require('better-sqlite3');
 
 const app  = express();
 const PORT = 3001;
@@ -41,544 +17,510 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
-// Защита от флуда
+// ─── Rate limiting ────────────────────────────────────────────────────────────
 const rateLimit = require('express-rate-limit');
+app.use('/klines',  rateLimit({ windowMs:60000, max:600, handler:(req,res)=>res.status(429).json({error:'Too many requests'}) }));
+app.use('/symbols', rateLimit({ windowMs:60000, max:120, handler:(req,res)=>res.status(429).json({error:'Too many requests'}) }));
+app.use('/tickers', rateLimit({ windowMs:60000, max:120, handler:(req,res)=>res.status(429).json({error:'Too many requests'}) }));
 
-const limiterGeneral = rateLimit({
-  windowMs: 60 * 1000, // 1 минута
-  max: 120,            // не более 120 запросов в минуту с одного IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => res.status(429).json({ error: 'Слишком много запросов, подожди минуту' })
+// ─── SQLite ───────────────────────────────────────────────────────────────────
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const db = new Database(path.join(DATA_DIR, 'candles.db'));
+db.pragma('journal_mode = WAL');   // быстрая запись
+db.pragma('synchronous = NORMAL'); // баланс скорость/надёжность
+db.pragma('cache_size = -64000');  // 64 МБ кэш SQLite
+db.pragma('temp_store = MEMORY');
+
+// Создаём таблицы
+db.exec(`
+  CREATE TABLE IF NOT EXISTS candles (
+    exchange TEXT NOT NULL,
+    symbol   TEXT NOT NULL,
+    tf       TEXT NOT NULL,
+    time     INTEGER NOT NULL,
+    open     REAL NOT NULL,
+    high     REAL NOT NULL,
+    low      REAL NOT NULL,
+    close    REAL NOT NULL,
+    volume   REAL NOT NULL,
+    PRIMARY KEY (exchange, symbol, tf, time)
+  );
+  CREATE INDEX IF NOT EXISTS idx_candles_query ON candles(exchange, symbol, tf, time DESC);
+
+  CREATE TABLE IF NOT EXISTS download_state (
+    exchange TEXT NOT NULL,
+    symbol   TEXT NOT NULL,
+    tf       TEXT NOT NULL,
+    oldest_time  INTEGER DEFAULT NULL,
+    newest_time  INTEGER DEFAULT NULL,
+    full_loaded  INTEGER DEFAULT 0,
+    PRIMARY KEY (exchange, symbol, tf)
+  );
+`);
+
+// Подготовленные запросы
+const stmtInsert = db.prepare(`
+  INSERT OR REPLACE INTO candles (exchange,symbol,tf,time,open,high,low,close,volume)
+  VALUES (@exchange,@symbol,@tf,@time,@open,@high,@low,@close,@volume)
+`);
+const stmtGetNewest = db.prepare(`SELECT MAX(time) as t FROM candles WHERE exchange=? AND symbol=? AND tf=?`);
+const stmtGetOldest = db.prepare(`SELECT MIN(time) as t FROM candles WHERE exchange=? AND symbol=? AND tf=?`);
+const stmtGetState  = db.prepare(`SELECT * FROM download_state WHERE exchange=? AND symbol=? AND tf=?`);
+const stmtSetState  = db.prepare(`
+  INSERT OR REPLACE INTO download_state (exchange,symbol,tf,oldest_time,newest_time,full_loaded)
+  VALUES (@exchange,@symbol,@tf,@oldest_time,@newest_time,@full_loaded)
+`);
+const stmtCount = db.prepare(`SELECT COUNT(*) as n FROM candles WHERE exchange=? AND symbol=? AND tf=?`);
+
+// Пакетная вставка
+const insertMany = db.transaction((rows) => {
+  for (const row of rows) stmtInsert.run(row);
 });
 
-const limiterKlines = rateLimit({
-  windowMs: 60 * 1000, // 1 минута
-  max: 600,             // для тяжёлых запросов свечей — не более 600
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => res.status(429).json({ error: 'Слишком много запросов свечей, подожди минуту' })
-});
+// ─── HTTP запрос к Binance ────────────────────────────────────────────────────
+const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
-app.use('/ping',    limiterGeneral);
-app.use('/symbols', limiterGeneral);
-app.use('/tickers', limiterGeneral);
-app.use('/klines',  limiterKlines);
-
-// --- Keep-alive ����� (�������������� TCP ����������) -------------------------
-const agent = new https.Agent({ keepAlive: true, maxSockets: 20 });
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-// --- HTTP ������ � ���������� ������-����� ------------------------------------
-function httpGet(hostname, path) {
+function httpGet(path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname, path, method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate' } },
+      { hostname: 'fapi.binance.com', path, method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate' },
+        agent },
       (res) => {
-        let chunks = [];
+        const chunks = [];
         res.on('data', c => chunks.push(c));
         res.on('end', () => {
           const buf = Buffer.concat(chunks);
-          const encoding = res.headers['content-encoding'];
-          const decode = (data) => {
-            try { return JSON.parse(data); }
-            catch (e) { reject(new Error('JSON parse: ' + data.toString().slice(0, 100))); }
+          const enc = res.headers['content-encoding'];
+          const parse = (data) => {
+            try { resolve(JSON.parse(data)); }
+            catch(e) { reject(new Error('JSON parse: ' + data.toString().slice(0,100))); }
           };
-          if (encoding === 'gzip') {
-            zlib.gunzip(buf, (err, decoded) => {
-              if (err) return reject(err);
-              resolve(decode(decoded.toString()));
-            });
-          } else if (encoding === 'deflate') {
-            zlib.inflate(buf, (err, decoded) => {
-              if (err) return reject(err);
-              resolve(decode(decoded.toString()));
-            });
-          } else {
-            resolve(decode(buf.toString()));
-          }
+          if (enc === 'gzip')    zlib.gunzip(buf, (e,d) => e ? reject(e) : parse(d.toString()));
+          else if (enc === 'deflate') zlib.inflate(buf, (e,d) => e ? reject(e) : parse(d.toString()));
+          else parse(buf.toString());
         });
       }
     );
     req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
 
-// --- Rate-limiter � ������� �������� ��� ������ ����� ------------------------
-// ��������� �� ����� `rps` �������� � ������� �� �����
-class RateLimiter {
-  constructor(rps) {
-    this.interval = 1000 / rps; // �� ����� ���������
-    this.queue    = [];
-    this.running  = false;
-  }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// Rate limiter для Binance (не более 18 запросов/сек)
+class RateLimiter {
+  constructor(rps) { this.interval = 1000/rps; this.queue = []; this.running = false; }
   schedule(fn) {
     return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
+      this.queue.push({fn, resolve, reject});
       if (!this.running) this._run();
     });
   }
-
   async _run() {
     this.running = true;
     while (this.queue.length) {
-      const { fn, resolve, reject } = this.queue.shift();
-      try { resolve(await fn()); } catch (e) { reject(e); }
+      const {fn, resolve, reject} = this.queue.shift();
+      try { resolve(await fn()); } catch(e) { reject(e); }
       if (this.queue.length) await sleep(this.interval);
     }
     this.running = false;
   }
 }
+const limiter = new RateLimiter(10); // консервативно 10 rps при скачивании
 
-// ������: Binance ~20/s, Bybit ~10/s, OKX ~4/s, GateIO ~10/s, Bitget ~10/s
-const limiters = {
-  binance: new RateLimiter(18),
-  bybit:   new RateLimiter(10),
-  okx:     new RateLimiter(4),
-  gateio:  new RateLimiter(10),
-  bitget:  new RateLimiter(10),
-};
+// ─── Прогресс-бар ─────────────────────────────────────────────────────────────
+function progressBar(current, total, width = 30) {
+  const pct  = total > 0 ? current / total : 0;
+  const filled = Math.round(pct * width);
+  const bar  = '█'.repeat(filled) + '░'.repeat(width - filled);
+  return `${bar} ${Math.round(pct*100)}% (${current}/${total})`;
+}
 
-// --- Retry � ���������������� backoff ----------------------------------------
-async function fetchWithRetry(exchange, hostname, path, retries = 4) {
-  const limiter = limiters[exchange];
-  let delay = 500;
-  for (let i = 0; i < retries; i++) {
+// ─── Binance API ──────────────────────────────────────────────────────────────
+const TF_MAP = { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' };
+const TIMEFRAMES = ['1m','5m','15m','1h','4h','1d'];
+
+async function binanceKlines(symbol, interval, limit=1000, endTime=null) {
+  let qs = `symbol=${symbol}&interval=${TF_MAP[interval]}&limit=${limit}`;
+  if (endTime) qs += `&endTime=${endTime}`;
+  const data = await limiter.schedule(() => httpGet(`/fapi/v1/klines?${qs}`));
+  if (!Array.isArray(data)) throw new Error('Не массив: ' + JSON.stringify(data).slice(0,100));
+  return data.map(c => ({
+    time:   Math.floor(c[0]/1000),
+    open:   parseFloat(c[1]),
+    high:   parseFloat(c[2]),
+    low:    parseFloat(c[3]),
+    close:  parseFloat(c[4]),
+    volume: parseFloat(c[5]),
+    openTime: c[0]
+  }));
+}
+
+async function binanceSymbols() {
+  const d = await httpGet('/fapi/v1/exchangeInfo');
+  return d.symbols
+    .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
+    .map(s => s.symbol);
+}
+
+async function binanceTickers() {
+  const d = await httpGet('/fapi/v1/ticker/24hr');
+  if (!Array.isArray(d)) return [];
+  return d.map(t => ({
+    symbol: t.symbol,
+    price: parseFloat(t.lastPrice),
+    priceChangePercent: parseFloat(t.priceChangePercent),
+    quoteVolume: parseFloat(t.quoteVolume),
+    count: parseInt(t.count) || 0,
+  }));
+}
+
+// Примерное кол-во свечей на TF (для прогресс-бара)
+const TF_ESTIMATE = { '1m':280000,'5m':56000,'15m':19000,'1h':4500,'4h':1200,'1d':300 };
+
+// ─── Скачивание ПОЛНОЙ истории одной монеты/TF ────────────────────────────────
+async function downloadFullHistory(symbol, tf) {
+  const state = stmtGetState.get('binance', symbol, tf);
+  if (state && state.full_loaded) return 0; // уже скачано полностью
+
+  let endTime   = state?.oldest_time ? (state.oldest_time * 1000 - 1) : null;
+  let totalNew  = 0;
+  let batchNum  = 0;
+  const estimate = TF_ESTIMATE[tf] || 5000;
+  let lastLogBatch = -1;
+
+  while (true) {
+    let batch;
     try {
-      return await (limiter
-        ? limiter.schedule(() => httpGet(hostname, path))
-        : httpGet(hostname, path));
-    } catch (e) {
-      const isRetryable = e.status === 429 || e.status === 418 || e.status >= 500 || e.message === 'Timeout';
-      if (!isRetryable || i === retries - 1) throw e;
-      console.warn(`[${exchange}] retry ${i+1}/${retries} (${e.message}), ��� ${delay}ms`);
-      await sleep(delay);
-      delay *= 2; // 500 > 1000 > 2000 > 4000
+      batch = await binanceKlines(symbol, tf, 1000, endTime);
+    } catch(e) {
+      if (e.message.includes('429') || e.message.includes('418')) {
+        console.warn(`[download]   ${tf}: rate limit, ждём 5 сек...`);
+        await sleep(5000);
+        continue;
+      }
+      throw e;
+    }
+
+    if (!batch || batch.length === 0) break;
+
+    // Сохраняем батч в БД
+    const rows = batch.map(c => ({
+      exchange: 'binance', symbol, tf,
+      time: c.time, open: c.open, high: c.high,
+      low: c.low, close: c.close, volume: c.volume
+    }));
+    insertMany(rows);
+    totalNew += rows.length;
+    batchNum++;
+
+    // Обновляем статус для /download-status
+    const pct = Math.min(Math.round(totalNew / estimate * 100), 99);
+    downloadStatus.currentTf  = tf;
+    downloadStatus.currentPct = pct;
+    downloadStatus.currentCandles = totalNew;
+    downloadStatus.currentEstimate = estimate;
+
+    // Логируем каждые 10 батчей (10000 свечей)
+    if (batchNum % 10 === 0 && batchNum !== lastLogBatch) {
+      lastLogBatch = batchNum;
+      const bar = progressBar(Math.min(totalNew, estimate), estimate, 24);
+      console.log(`[download]   ${tf}: ${bar} (${totalNew} свечей)`);
+    }
+
+    // Следующий батч — ещё глубже в историю
+    endTime = batch[0].openTime - 1;
+
+    // Если меньше 1000 — дошли до начала истории
+    if (batch.length < 1000) {
+      const oldest = stmtGetOldest.get('binance', symbol, tf)?.t;
+      const newest = stmtGetNewest.get('binance', symbol, tf)?.t;
+      stmtSetState.run({ exchange:'binance', symbol, tf,
+        oldest_time: oldest, newest_time: newest, full_loaded: 1 });
+      break;
+    }
+
+    // Сохраняем состояние каждые 5 батчей
+    if (batchNum % 5 === 0) {
+      const oldest = stmtGetOldest.get('binance', symbol, tf)?.t;
+      const newest = stmtGetNewest.get('binance', symbol, tf)?.t;
+      stmtSetState.run({ exchange:'binance', symbol, tf,
+        oldest_time: oldest, newest_time: newest, full_loaded: 0 });
+    }
+
+    await sleep(100);
+  }
+
+  // Финальная строка (только если были новые свечи)
+  if (totalNew > 0) {
+    console.log(`[download]   ${tf}: ${'█'.repeat(24)} 100% (${totalNew} свечей) ✓`);
+  }
+  return totalNew;
+}
+
+// ─── Обновление новых свечей (инкрементально) ─────────────────────────────────
+async function updateSymbol(symbol, tf) {
+  const newest = stmtGetNewest.get('binance', symbol, tf)?.t;
+  const startTime = newest ? (newest * 1000 + 1) : null;
+
+  let qs = `symbol=${symbol}&interval=${TF_MAP[tf]}&limit=1000`;
+  if (startTime) qs += `&startTime=${startTime}`;
+
+  let batch;
+  try {
+    batch = await limiter.schedule(() => httpGet(`/fapi/v1/klines?${qs}`));
+  } catch(e) { return 0; }
+
+  if (!Array.isArray(batch) || batch.length === 0) return 0;
+
+  const rows = batch.map(c => ({
+    exchange:'binance', symbol, tf,
+    time: Math.floor(c[0]/1000), open: parseFloat(c[1]),
+    high: parseFloat(c[2]), low: parseFloat(c[3]),
+    close: parseFloat(c[4]), volume: parseFloat(c[5])
+  }));
+  insertMany(rows);
+
+  // Обновляем newest_time
+  const newNewest = stmtGetNewest.get('binance', symbol, tf)?.t;
+  const oldest    = stmtGetOldest.get('binance', symbol, tf)?.t;
+  const state     = stmtGetState.get('binance', symbol, tf);
+  stmtSetState.run({ exchange:'binance', symbol, tf,
+    oldest_time: oldest, newest_time: newNewest,
+    full_loaded: state?.full_loaded || 0 });
+
+  return rows.length;
+}
+
+// ─── Мета-кэш (символы и тикеры) ─────────────────────────────────────────────
+let metaCache = { symbols: [], tickers: [], updatedAt: 0 };
+
+async function getMeta() {
+  if (Date.now() - metaCache.updatedAt < 5 * 60_000) return metaCache;
+  const [symbols, tickers] = await Promise.all([binanceSymbols(), binanceTickers()]);
+  metaCache = { symbols, tickers, updatedAt: Date.now() };
+  return metaCache;
+}
+
+// ─── Первичная загрузка всей истории ─────────────────────────────────────────
+let downloadInProgress = false;
+let downloadStatus = { total: 0, done: 0, current: '', currentTf: '', currentPct: 0, failed: [] };
+
+async function runFullDownload() {
+  if (downloadInProgress) return;
+  downloadInProgress = true;
+
+  console.log('\n[download] ═══════════════════════════════════════');
+  console.log('[download] Начинаю загрузку полной истории Binance');
+  console.log('[download] ═══════════════════════════════════════\n');
+
+  const meta = await getMeta();
+  const symbols = meta.symbols;
+  downloadStatus.total = symbols.length;
+  downloadStatus.done  = 0;
+  downloadStatus.failed = [];
+
+  for (let i = 0; i < symbols.length; i++) {
+    const symbol = symbols[i];
+    downloadStatus.current = symbol;
+    downloadStatus.done    = i;
+
+    console.log(`\n[download] Общий прогресс: ${progressBar(i, symbols.length)}`);
+    console.log(`[download] Монета: ${symbol}`);
+
+    for (const tf of TIMEFRAMES) {
+      const state = stmtGetState.get('binance', symbol, tf);
+      if (state && state.full_loaded) {
+        console.log(`[download]   ${tf}: уже скачан ✓`);
+        continue;
+      }
+
+      downloadStatus.currentTf = tf;
+      let attempts = 0;
+
+      while (attempts < 3) {
+        try {
+          await downloadFullHistory(symbol, tf);
+          break;
+        } catch(e) {
+          attempts++;
+          console.warn(`[download]   ${tf}: ошибка (попытка ${attempts}/3): ${e.message}`);
+          if (attempts < 3) await sleep(3000);
+          else {
+            downloadStatus.failed.push(`${symbol}:${tf}`);
+            console.error(`[download]   ${tf}: пропускаем ✗`);
+          }
+        }
+      }
+
+      await sleep(200); // пауза между TF
+    }
+  }
+
+  downloadStatus.done = symbols.length;
+  console.log(`\n[download] ═══════════════════════════════════════`);
+  console.log(`[download] ✅ Загрузка завершена! ${symbols.length} монет`);
+  if (downloadStatus.failed.length > 0) {
+    console.log(`[download] ⚠ Не загружено: ${downloadStatus.failed.length} позиций`);
+    console.log(`[download]   ${downloadStatus.failed.join(', ')}`);
+  }
+  console.log(`[download] ═══════════════════════════════════════\n`);
+
+  downloadInProgress = false;
+}
+
+// ─── Автообновление новых свечей каждую минуту ───────────────────────────────
+async function runUpdater() {
+  while (true) {
+    await sleep(60_000); // каждую минуту
+    if (downloadInProgress) continue; // не мешаем первичной загрузке
+
+    try {
+      const meta = await getMeta();
+      let totalNew = 0;
+      for (const symbol of meta.symbols) {
+        for (const tf of TIMEFRAMES) {
+          const state = stmtGetState.get('binance', symbol, tf);
+          if (!state || !state.full_loaded) continue; // ещё не скачано
+          const n = await updateSymbol(symbol, tf);
+          totalNew += n;
+          await sleep(50);
+        }
+      }
+      if (totalNew > 0) console.log(`[update] +${totalNew} новых свечей`);
+    } catch(e) {
+      console.warn('[update] Ошибка:', e.message);
     }
   }
 }
 
-// --- ������������ ������������� �������� -------------------------------------
-// ���� ��� ������� ������������ ��������� ���� � ��� �� ������ �
-// ������ ������ ���� �������� ������ � �����
-const inFlight = new Map();
-
-function dedupe(key, fn) {
-  if (inFlight.has(key)) return inFlight.get(key);
-  const p = fn().finally(() => inFlight.delete(key));
-  inFlight.set(key, p);
-  return p;
-}
-
-// --- �������� ���� ------------------------------------------------------------
-// ������ ������ �����: { time(���), open, high, low, close, volume, openTime(��) }
-
-const Binance = {
-  name: 'binance',
-  host: 'fapi.binance.com',
-
-  async getSymbols() {
-    const d = await httpGet('fapi.binance.com', '/fapi/v1/exchangeInfo');
-    if (!d || !Array.isArray(d.symbols)) return [];
-    return d.symbols.filter(s => /^[A-Z0-9]+$/.test(s.symbol)).filter(s => /^[A-Z0-9]+$/.test(s.symbol))
-      .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
-      .map(s => s.symbol);
-  },
-
-  async getTickers() {
-    const d = await httpGet('fapi.binance.com', '/fapi/v1/ticker/24hr');
-    if (!Array.isArray(d)) return [];
-    return d.map(t => ({
-      symbol: t.symbol,
-      price: parseFloat(t.lastPrice),
-      priceChangePercent: parseFloat(t.priceChangePercent),
-      quoteVolume: parseFloat(t.quoteVolume),
-      count: parseInt(t.count) || 0,
-    }));
-  },
-
-  tfMap: { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' },
-
-  async getKlines(symbol, interval, limit = 1000, endTime = null) {
-    const tf = this.tfMap[interval] || interval;
-    let qs = `symbol=${symbol}&interval=${tf}&limit=${limit}`;
-    if (endTime) qs += `&endTime=${endTime}`;
-    const d = await fetchWithRetry('binance', this.host, `/fapi/v1/klines?${qs}`);
-    if (!Array.isArray(d)) return [];
-    return d.map(c => ({
-      time: c[0]/1000, open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5], openTime:c[0]
-    }));
-  },
-};
-
-const Bybit = {
-  name: 'bybit',
-  host: 'api.bybit.com',
-
-  async getSymbols() {
-    const d = await fetchWithRetry('bybit', this.host, '/v5/market/instruments-info?category=linear&limit=1000');
-    return (d.result?.list || [])
-      .filter(s => s.status === 'Trading' && s.quoteCoin === 'USDT')
-      .map(s => s.symbol);
-  },
-
-  async getTickers() {
-    const d = await fetchWithRetry('bybit', this.host, '/v5/market/tickers?category=linear');
-    return (d.result?.list || [])
-      .filter(t => t.symbol.endsWith('USDT'))
-      .map(t => ({
-        symbol: t.symbol,
-        price: parseFloat(t.lastPrice),
-        priceChangePercent: parseFloat(t.price24hPcnt) * 100,
-        quoteVolume: parseFloat(t.turnover24h),
-        count: 0,
-      }));
-  },
-
-  tfMap: { '1m':'1','5m':'5','15m':'15','1h':'60','4h':'240','1d':'D' },
-
-  async getKlines(symbol, interval, limit = 1000, endTime = null) {
-    const tf = this.tfMap[interval] || interval;
-    let qs = `category=linear&symbol=${symbol}&interval=${tf}&limit=${limit}`;
-    if (endTime) qs += `&end=${endTime}`;
-    const d = await fetchWithRetry('bybit', this.host, `/v5/market/kline?${qs}`);
-    return (d.result?.list || []).reverse().map(c => ({
-      time: +c[0]/1000, open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5], openTime:+c[0]
-    }));
-  },
-};
-
-const OKX = {
-  name: 'okx',
-  host: 'www.okx.com',
-
-  async getSymbols() {
-    const d = await fetchWithRetry('okx', this.host, '/api/v5/public/instruments?instType=SWAP');
-    return (d.data || [])
-      .filter(s => s.state === 'live' && s.ctType === 'linear' && s.settleCcy === 'USDT')
-      .map(s => s.instId);
-  },
-
-  async getTickers() {
-    const d = await fetchWithRetry('okx', this.host, '/api/v5/market/tickers?instType=SWAP');
-    return (d.data || [])
-      .filter(t => t.instId.endsWith('-USDT-SWAP'))
-      .map(t => ({
-        symbol: t.instId,
-        price: parseFloat(t.last),
-        priceChangePercent: parseFloat(t.open24h) > 0
-          ? ((parseFloat(t.last) - parseFloat(t.open24h)) / parseFloat(t.open24h)) * 100
-          : 0,
-        quoteVolume: parseFloat(t.volCcy24h),
-        count: 0,
-      }));
-  },
-
-  tfMap: { '1m':'1m','5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D' },
-
-  async getKlines(symbol, interval, limit = 300, endTime = null) {
-    const tf = this.tfMap[interval] || interval;
-    let qs = `instId=${symbol}&bar=${tf}&limit=${limit}`;
-    if (endTime) qs += `&after=${endTime}`;
-    const d = await fetchWithRetry('okx', this.host, `/api/v5/market/candles?${qs}`);
-    return (d.data || []).reverse().map(c => ({
-      time: +c[0]/1000, open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5], openTime:+c[0]
-    }));
-  },
-};
-
-const GateIO = {
-  name: 'gateio',
-  host: 'api.gateio.ws',
-
-  async getSymbols() {
-    const d = await fetchWithRetry('gateio', this.host, '/api/v4/futures/usdt/contracts');
-    return (Array.isArray(d) ? d : [])
-      .filter(s => !s.in_delisting)
-      .map(s => s.name);
-  },
-
-  async getTickers() {
-    const d = await fetchWithRetry('gateio', this.host, '/api/v4/futures/usdt/tickers');
-    return (Array.isArray(d) ? d : []).map(t => ({
-      symbol: t.contract,
-      price: parseFloat(t.last),
-      priceChangePercent: parseFloat(t.change_percentage),
-      quoteVolume: parseFloat(t.volume_24h_quote || t.volume_24h_settle || 0),
-      count: 0,
-    }));
-  },
-
-  tfMap: { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' },
-
-  async getKlines(symbol, interval, limit = 1000, endTime = null) {
-    const tf = this.tfMap[interval] || interval;
-    let qs = `contract=${symbol}&interval=${tf}&limit=${limit}`;
-    if (endTime) qs += `&to=${Math.floor(endTime / 1000)}`;
-    const d = await fetchWithRetry('gateio', this.host, `/api/v4/futures/usdt/candlesticks?${qs}`);
-    return (Array.isArray(d) ? d : []).map(c => ({
-      time: +c.t, open:+c.o, high:+c.h, low:+c.l, close:+c.c, volume:+c.v, openTime:+c.t*1000
-    }));
-  },
-};
-
-const Bitget = {
-  name: 'bitget',
-  host: 'api.bitget.com',
-
-  // Bitget: symbols � tickers � ����� ��������� � �������� ���������
-  _tickersCache: null,
-  _tickersCachedAt: 0,
-
-  async _fetchTickers() {
-    const now = Date.now();
-    if (this._tickersCache && now - this._tickersCachedAt < 30_000) return this._tickersCache;
-    const d = await fetchWithRetry('bitget', this.host, '/api/v2/mix/market/tickers?productType=USDT-FUTURES');
-    this._tickersCache = d.data || [];
-    this._tickersCachedAt = now;
-    return this._tickersCache;
-  },
-
-  async getSymbols() {
-    const data = await this._fetchTickers();
-    return data.map(s => s.symbol);
-  },
-
-  async getTickers() {
-    const data = await this._fetchTickers();
-    return data.map(t => ({
-      symbol: t.symbol,
-      price: parseFloat(t.lastPr),
-      priceChangePercent: parseFloat(t.change24h) * 100,
-      quoteVolume: parseFloat(t.quoteVolume || t.usdtVolume || 0),
-      count: 0,
-    }));
-  },
-
-  tfMap: { '1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'4h','1d':'1d' },
-
-  async getKlines(symbol, interval, limit = 1000, endTime = null) {
-    const tf = this.tfMap[interval] || interval;
-    let qs = `symbol=${symbol}&granularity=${tf}&limit=${limit}&productType=usdt-futures`;
-    if (endTime) qs += `&endTime=${endTime}`;
-    const d = await fetchWithRetry('bitget', this.host, `/api/v2/mix/market/candles?${qs}`);
-    return (d.data || []).reverse().map(c => ({
-      time: +c[0]/1000, open:+c[1], high:+c[2], low:+c[3], close:+c[4], volume:+c[5], openTime:+c[0]
-    }));
-  },
-};
-
-const EXCHANGES = { binance: Binance, bybit: Bybit, okx: OKX, gateio: GateIO, bitget: Bitget };
-
-// --- ����� ��� ������ ---------------------------------------------------------
-// ������������ ����� (��������) � �� �������� ������� > ������ ���������
-// ������ ��������� �������� ����� ��������� �� TTL
-const kCache = {};  // kCache[exchange][symbol][interval] = { candles[], lastOpenTime, updatedAt }
-
-const REFRESH_TTL = {
-  '1m': 30_000,   '5m': 60_000,  '15m': 90_000,
-  '1h': 120_000,  '4h': 180_000, '1d': 300_000,
-};
-
-function getCache(exchange, symbol, interval) {
-  // Сначала смотрим в RAM
-  const ram = kCache[exchange]?.[symbol]?.[interval] || null;
-  if (ram) return ram;
-  // Потом смотрим на диске
-  const key = `${exchange}:${symbol}:${interval}`;
-  const disk = diskCache[key];
-  if (disk) return disk;
-  return null;
-}
-
-function setCache(exchange, symbol, interval, data) {
-  // Пишем в RAM
-  if (!kCache[exchange]) kCache[exchange] = {};
-  if (!kCache[exchange][symbol]) kCache[exchange][symbol] = {};
-  kCache[exchange][symbol][interval] = { candles: data, updatedAt: Date.now() };
-  // Пишем на диск
-  const key = `${exchange}:${symbol}:${interval}`;
-  diskCache[key] = { candles: data, updatedAt: Date.now() };
-}
-
-function needsRefresh(cached, interval) {
-  if (!cached) return true;
-  const ttl = REFRESH_TTL[interval] || 60_000;
-  return Date.now() - cached.updatedAt > ttl;
-}
-
-// --- �������� ������� (��������� ������ �����) --------------------------------
-async function loadHistory(exchange, symbol, interval) {
-  const ex = EXCHANGES[exchange];
-  // OKX ��� 300 ������ �� ��� > ����� 13 �������� ��� ~3900 ������ (~1 ��� �� 5m)
-  // ��������� ���� 1000 > 4 ������� = ~4000 ������
-  const passes  = exchange === 'okx' ? 13 : 4;
-  const limit   = exchange === 'okx' ? 300 : 1000;
-
-  let all = [];
-  let endTime = null;
-
-  for (let i = 0; i < passes; i++) {
-    const batch = await ex.getKlines(symbol, interval, limit, endTime);
-    if (!batch || batch.length === 0) break;
-    all = [...batch, ...all];
-    endTime = batch[0].openTime - 1;
-    // ��������� ����� ������ ���� ���������� (�� ��������� ����)
-    if (i < passes - 1 && batch.length === limit) await sleep(80);
-    else break; // �������� ������ ������ � ������� �����������
-  }
-
-  // ������� �����, ���������
-  const seen = new Set();
-  return all
-    .filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; })
-    .sort((a, b) => a.time - b.time);
-}
-
-// --- ��������������� ���������� ���� -----------------------------------------
-// ������ ������������ ���� ������� � ����������� ������ ����� �����
-async function refreshCache(exchange, symbol, interval, cached) {
-  const ex = EXCHANGES[exchange];
-  // ����������� ����� ������� � ��������� �������� (��� endTime = ��������� N)
-  const fresh = await ex.getKlines(symbol, interval, exchange === 'okx' ? 300 : 1000);
-  if (!fresh || fresh.length === 0) return cached.candles;
-
-  // ������: ���� ��� ������ �������� ����� + ��� �����
-  const cutoff = cached.candles.length > 1
-    ? cached.candles[cached.candles.length - 2].openTime  // �� ������������� ������������
-    : 0;
-  const oldPart = cached.candles.filter(c => c.openTime <= cutoff);
-  const merged  = [...oldPart, ...fresh];
-
-  // ����� + ����������
-  const seen = new Set();
-  return merged
-    .filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; })
-    .sort((a, b) => a.time - b.time);
-}
-
-// --- ��� ���������� (������� + ������) ---------------------------------------
-const metaCache = {};
-const META_TTL  = 5 * 60_000; // 5 �����
-
-async function getMeta(exchange) {
-  const now = Date.now();
-  if (metaCache[exchange] && now - metaCache[exchange].updatedAt < META_TTL) {
-    return metaCache[exchange];
-  }
-  const ex = EXCHANGES[exchange];
-  const [symbols, tickers] = await Promise.all([ex.getSymbols(), ex.getTickers()]);
-  metaCache[exchange] = { symbols, tickers, updatedAt: now };
-  return metaCache[exchange];
-}
-
-// --- ����� --------------------------------------------------------------------
+// ─── Роуты ───────────────────────────────────────────────────────────────────
 
 app.get('/ping', (req, res) => {
-  const cacheStats = {};
-  for (const ex of Object.keys(kCache)) {
-    let syms = 0, candles = 0;
-    for (const sym of Object.keys(kCache[ex])) {
-      syms++;
-      for (const tf of Object.keys(kCache[ex][sym])) {
-        candles += kCache[ex][sym][tf].candles.length;
-      }
-    }
-    cacheStats[ex] = { syms, candles };
-  }
-  res.json({ ok: true, uptime: Math.round(process.uptime()), cache: cacheStats });
+  const dbSize = (() => {
+    try {
+      const stat = fs.statSync(path.join(DATA_DIR, 'candles.db'));
+      return Math.round(stat.size / 1024 / 1024) + ' МБ';
+    } catch { return '0 МБ'; }
+  })();
+  res.json({
+    ok: true,
+    uptime: Math.round(process.uptime()),
+    download: {
+      inProgress: downloadInProgress,
+      total: downloadStatus.total,
+      done:  downloadStatus.done,
+      current: downloadStatus.current,
+      pct: downloadStatus.total > 0 ? Math.round(downloadStatus.done / downloadStatus.total * 100) : 0,
+      failed: downloadStatus.failed.length
+    },
+    dbSize
+  });
 });
 
-app.get('/exchanges', (req, res) => res.json(Object.keys(EXCHANGES)));
+// Статус загрузки
+app.get('/download-status', (req, res) => {
+  const cur = downloadStatus.currentCandles || 0;
+  const est = downloadStatus.currentEstimate || 1000;
+  res.json({
+    inProgress:  downloadInProgress,
+    total:       downloadStatus.total,
+    done:        downloadStatus.done,
+    failed:      downloadStatus.failed,
+    current:     downloadStatus.current,
+    currentTf:   downloadStatus.currentTf,
+    // Общий прогресс
+    totalBar:    progressBar(downloadStatus.done, downloadStatus.total),
+    totalPct:    downloadStatus.total > 0 ? Math.round(downloadStatus.done / downloadStatus.total * 100) : 0,
+    // Прогресс текущей монеты/TF
+    coinBar:     progressBar(Math.min(cur, est), est, 24),
+    coinPct:     downloadStatus.currentPct || 0,
+    coinCandles: cur,
+  });
+});
 
-// GET /symbols?exchange=binance
 app.get('/symbols', async (req, res) => {
-  const { exchange = 'binance' } = req.query;
-  if (!EXCHANGES[exchange]) return res.status(400).json({ error: '����������� �����' });
   try {
-    const meta = await getMeta(exchange);
+    const meta = await getMeta();
     res.json(meta.symbols);
-  } catch (e) {
-    console.error('[/symbols]', e.message);
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /tickers?exchange=binance
 app.get('/tickers', async (req, res) => {
-  const { exchange = 'binance' } = req.query;
-  if (!EXCHANGES[exchange]) return res.status(400).json({ error: '����������� �����' });
   try {
-    const meta = await getMeta(exchange);
+    const meta = await getMeta();
     res.json(meta.tickers);
-  } catch (e) {
-    console.error('[/tickers]', e.message);
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /klines?exchange=binance&symbol=BTCUSDT&interval=5m
+// GET /klines?symbol=BTCUSDT&interval=5m&limit=1000&before=<timestamp_sec>
 app.get('/klines', async (req, res) => {
-  const { exchange = 'binance', symbol, interval = '5m' } = req.query;
-  if (!symbol)              return res.status(400).json({ error: '����� symbol' });
-  if (!EXCHANGES[exchange]) return res.status(400).json({ error: '����������� �����' });
+  const { symbol, interval = '5m', limit = 1000, before } = req.query;
+  if (!symbol) return res.status(400).json({ error: 'Нужен symbol' });
 
-  const cached = getCache(exchange, symbol, interval);
+  const lim = Math.min(parseInt(limit) || 1000, 2000);
 
-  // ��� ������ � ����� �����
-  if (!needsRefresh(cached, interval)) {
-    return res.json(cached.candles);
-  }
-
-  // ������������: ���� �������� ������ ���� ��� ������������ ����������
-  const key = `${exchange}:${symbol}:${interval}`;
   try {
-    let candles;
-    if (!cached) {
-      // ������ �������� � ������ �������
-      candles = await dedupe(key, () => loadHistory(exchange, symbol, interval));
+    let rows;
+    if (before) {
+      // Lazy loading — свечи ДО указанного времени
+      rows = db.prepare(`
+        SELECT time,open,high,low,close,volume,
+               (time * 1000) as openTime
+        FROM candles
+        WHERE exchange='binance' AND symbol=? AND tf=? AND time < ?
+        ORDER BY time DESC LIMIT ?
+      `).all(symbol, interval, parseInt(before), lim);
     } else {
-      // ���������� � ������ ����� �����
-      candles = await dedupe(key, () => refreshCache(exchange, symbol, interval, cached));
+      // Последние N свечей
+      rows = db.prepare(`
+        SELECT time,open,high,low,close,volume,
+               (time * 1000) as openTime
+        FROM candles
+        WHERE exchange='binance' AND symbol=? AND tf=?
+        ORDER BY time DESC LIMIT ?
+      `).all(symbol, interval, lim);
     }
-    setCache(exchange, symbol, interval, candles);
-    res.json(candles);
-  } catch (e) {
-    console.error(`[/klines] ${exchange} ${symbol} ${interval}:`, e.message);
-    // ����� ���������� ��� ���� ����
-    if (cached) return res.json(cached.candles);
+
+    // Возвращаем в хронологическом порядке
+    rows.reverse();
+    res.json(rows);
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /cache-status � ��������� ���������� ����
-app.get('/cache-status', (req, res) => {
-  const result = {};
-  for (const ex of Object.keys(kCache)) {
-    result[ex] = { symbols: 0, candles: 0, entries: [] };
-    for (const sym of Object.keys(kCache[ex])) {
-      result[ex].symbols++;
-      for (const tf of Object.keys(kCache[ex][sym])) {
-        const entry = kCache[ex][sym][tf];
-        result[ex].candles += entry.candles.length;
-        result[ex].entries.push({
-          symbol: sym, tf,
-          candles: entry.candles.length,
-          age: Math.round((Date.now() - entry.updatedAt) / 1000) + 's'
-        });
-      }
-    }
-  }
-  res.json(result);
+// Статистика БД
+app.get('/db-stats', (req, res) => {
+  const total = db.prepare(`SELECT COUNT(*) as n FROM candles`).get().n;
+  const byTf  = db.prepare(`SELECT tf, COUNT(*) as n FROM candles WHERE exchange='binance' GROUP BY tf`).all();
+  const dbSize = (() => {
+    try { return Math.round(fs.statSync(path.join(DATA_DIR,'candles.db')).size/1024/1024) + ' МБ'; }
+    catch { return '?'; }
+  })();
+  res.json({ total, byTf, dbSize });
 });
 
-// --- ������ -------------------------------------------------------------------
+// ─── Запуск ───────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`? KopiBar ������ �������: http://0.0.0.0:${PORT}`);
-  console.log(`   �����: ${Object.keys(EXCHANGES).join(', ')}`);
-  console.log(`   ��������: http://77.239.105.144:${PORT}/ping`);
+  console.log(`✅ KopiBar v2.0 запущен: http://0.0.0.0:${PORT}`);
+  console.log(`   БД: ${path.join(DATA_DIR, 'candles.db')}`);
+  console.log(`   Ping: http://77.239.105.144:${PORT}/ping`);
+
+  // Запускаем загрузку истории в фоне
+  setTimeout(() => {
+    runFullDownload().catch(e => console.error('[download] Критическая ошибка:', e.message));
+  }, 3000);
+
+  // Запускаем обновление новых свечей
+  runUpdater().catch(e => console.error('[update] Критическая ошибка:', e.message));
 });
