@@ -79,6 +79,43 @@ const insertMany = db.transaction((rows) => {
   for (const row of rows) stmtInsert.run(row);
 });
 
+function normalizeRows(rows) {
+  const byTime = new Map();
+  for (const row of rows || []) {
+    const time = Number(row.time);
+    const open = Number(row.open);
+    const high = Number(row.high);
+    const low = Number(row.low);
+    const close = Number(row.close);
+    const volume = Number(row.volume ?? 0);
+    const openTime = Number(row.openTime ?? time * 1000);
+    if (![time, open, high, low, close, volume, openTime].every(Number.isFinite)) continue;
+    byTime.set(time, {
+      time,
+      open,
+      high: Math.max(high, open, close),
+      low: Math.min(low, open, close),
+      close,
+      volume,
+      openTime
+    });
+  }
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
+async function getFreshTail(symbol, interval, limit = 120) {
+  const tail = await binanceKlines(symbol, interval, limit);
+  return tail.map(c => ({
+    time: c.time,
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+    volume: c.volume,
+    openTime: c.openTime
+  }));
+}
+
 // ─── HTTP запрос к Binance ────────────────────────────────────────────────────
 const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
@@ -442,7 +479,7 @@ async function runUpdater() {
 
 // ─── Серверный расчёт статистики (NATR / волатильность / корреляция) ──────────
 
-// statsCache[tf][symbol] = { natr, volat, corr, updatedAt }
+// statsCache[cacheKey][symbol] = { natr, volat, corr, updatedAt }
 const statsCache = {};
 
 // Периоды (в часах) — используем дефолтные значения как на фронте
@@ -474,36 +511,54 @@ function calcVolat(candles, periodH, tfMin) {
   const rets = [];
   for (let i = 1; i < slice.length; i++) {
     if (slice[i-1].close > 0 && slice[i].close > 0)
-      rets.push(Math.log(slice[i].close / slice[i-1].close));
+      rets.push((slice[i].close - slice[i-1].close) / slice[i-1].close);
   }
-  if (rets.length < 2) return 0;
+  if (rets.length === 0) return 0;
+  if (rets.length === 1) return Math.abs(rets[0]) * 100;
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
   return Math.sqrt(rets.reduce((s, r) => s + (r - mean) ** 2, 0) / (rets.length - 1)) * 100;
 }
 
 function calcCorr(candles, btcCandles, periodH, tfMin) {
-  const n = Math.max(10, Math.round((periodH * 60) / tfMin));
-  const slice    = candles.slice(-n);
-  const btcMap   = new Map(btcCandles.map(c => [c.time, c.close]));
-  const x = [], y = [];
-  for (let i = 1; i < slice.length; i++) {
-    const btcPrev = btcMap.get(slice[i-1].time);
-    const btcCur  = btcMap.get(slice[i].time);
+  const windowSize = Math.max(24, Math.round((periodH * 60) / tfMin) + 1);
+  const aligned = candles
+    .slice(-windowSize)
+    .filter(c => Number.isFinite(c?.time) && Number.isFinite(c?.close) && c.close > 0)
+    .map(c => ({ time: c.time, close: c.close }));
+  const btcMap = new Map(
+    btcCandles
+      .filter(c => Number.isFinite(c?.time) && Number.isFinite(c?.close) && c.close > 0)
+      .map(c => [c.time, c.close])
+  );
+  const x = [];
+  const y = [];
+  for (let i = 1; i < aligned.length; i++) {
+    const prev = aligned[i - 1];
+    const cur = aligned[i];
+    const btcPrev = btcMap.get(prev.time);
+    const btcCur = btcMap.get(cur.time);
     if (!btcPrev || !btcCur) continue;
-    x.push((slice[i].close - slice[i-1].close) / slice[i-1].close);
-    y.push((btcCur - btcPrev) / btcPrev);
+    const assetRet = Math.log(cur.close / prev.close);
+    const btcRet = Math.log(btcCur / btcPrev);
+    if (!Number.isFinite(assetRet) || !Number.isFinite(btcRet)) continue;
+    x.push(assetRet);
+    y.push(btcRet);
   }
-  if (x.length < 2) return null;
+  if (x.length < 8) return null;
   const n2 = x.length;
   const mx = x.reduce((a, b) => a + b, 0) / n2;
   const my = y.reduce((a, b) => a + b, 0) / n2;
   let num = 0, dx2 = 0, dy2 = 0;
   for (let i = 0; i < n2; i++) {
-    const dx = x[i] - mx, dy = y[i] - my;
-    num += dx * dy; dx2 += dx * dx; dy2 += dy * dy;
+    const dx = x[i] - mx;
+    const dy = y[i] - my;
+    num += dx * dy;
+    dx2 += dx * dx;
+    dy2 += dy * dy;
   }
-  if (!dx2 || !dy2) return null;
-  return Math.round((num / Math.sqrt(dx2 * dy2)) * 100);
+  if (dx2 <= 1e-12 || dy2 <= 1e-12) return null;
+  const corr = num / Math.sqrt(dx2 * dy2);
+  return Math.max(-100, Math.min(100, Math.round(corr * 100)));
 }
 
 function getCandles(symbol, tf, limit) {
@@ -516,12 +571,16 @@ function getCandles(symbol, tf, limit) {
 
 const TF_MIN_MAP = { '1m':1,'5m':5,'15m':15,'1h':60,'4h':240,'1d':1440 };
 
-async function computeAllStats(tf) {
+function getStatsCacheKey(tf, natrPeriodH, volatPeriodH, corrPeriodH) {
+  return `${tf}|${natrPeriodH}|${volatPeriodH}|${corrPeriodH}`;
+}
+
+async function computeAllStats(tf, natrPeriodH = NATR_PERIOD_H, volatPeriodH = VOLAT_PERIOD_H, corrPeriodH = CORR_PERIOD_H) {
   const tfMin   = TF_MIN_MAP[tf] || 5;
   const needed  = Math.max(
-    Math.round((NATR_PERIOD_H  * 60) / tfMin),
-    Math.round((VOLAT_PERIOD_H * 60) / tfMin),
-    Math.round((CORR_PERIOD_H  * 60) / tfMin)
+    Math.round((natrPeriodH  * 60) / tfMin),
+    Math.round((volatPeriodH * 60) / tfMin),
+    Math.max(24, Math.round((corrPeriodH  * 60) / tfMin) + 1)
   ) + 10;
 
   // Загружаем BTC для корреляции
@@ -538,15 +597,15 @@ async function computeAllStats(tf) {
 
       const isBtc = symbol.replace(/[-_].*/,'').toUpperCase().startsWith('BTC');
       result[symbol] = {
-        natr:  parseFloat(calcNATR(candles, NATR_PERIOD_H, tfMin).toFixed(2)),
-        volat: parseFloat(calcVolat(candles, VOLAT_PERIOD_H, tfMin).toFixed(2)),
-        corr:  isBtc ? 100 : calcCorr(candles, btcCandles, CORR_PERIOD_H, tfMin),
+        natr:  parseFloat(calcNATR(candles, natrPeriodH, tfMin).toFixed(2)),
+        volat: parseFloat(calcVolat(candles, volatPeriodH, tfMin).toFixed(2)),
+        corr:  isBtc ? 100 : calcCorr(candles, btcCandles, corrPeriodH, tfMin),
       };
     } catch(e) { /* пропускаем */ }
   }
 
-  if (!statsCache[tf]) statsCache[tf] = {};
-  statsCache[tf] = { data: result, updatedAt: Date.now() };
+  const cacheKey = getStatsCacheKey(tf, natrPeriodH, volatPeriodH, corrPeriodH);
+  statsCache[cacheKey] = { data: result, updatedAt: Date.now() };
   return result;
 }
 
@@ -648,12 +707,16 @@ app.post('/fix-gaps', async (req, res) => {
 
 app.get('/stats', async (req, res) => {
   const tf = req.query.tf || '5m';
-  if (statsCache[tf] && statsCache[tf].data) {
-    return res.json(statsCache[tf].data);
+  const natrPeriodH = Math.max(1, Number(req.query.natrPeriod) || NATR_PERIOD_H);
+  const volatPeriodH = Math.max(1, Number(req.query.volatPeriod) || VOLAT_PERIOD_H);
+  const corrPeriodH = Math.max(1, Number(req.query.corrPeriod) || CORR_PERIOD_H);
+  const cacheKey = getStatsCacheKey(tf, natrPeriodH, volatPeriodH, corrPeriodH);
+
+  if (statsCache[cacheKey] && statsCache[cacheKey].data) {
+    return res.json(statsCache[cacheKey].data);
   }
-  // Если кэш ещё не готов — считаем прямо сейчас
   try {
-    const data = await computeAllStats(tf);
+    const data = await computeAllStats(tf, natrPeriodH, volatPeriodH, corrPeriodH);
     res.json(data);
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -811,16 +874,41 @@ app.get('/klines', async (req, res) => {
       }
     }
 
+    // Поверх данных из БД подмешиваем свежий хвост из Binance,
+    // чтобы последние свечи не отставали и не давали ложные гэпы.
+    if (!before) {
+      try {
+        const freshTailLimit = Math.min(lim, 120);
+        const freshTail = await getFreshTail(symbol, interval, freshTailLimit);
+        if (freshTail.length > 0) {
+          insertMany(freshTail.map(c => ({
+            exchange: 'binance',
+            symbol,
+            tf: interval,
+            time: c.time,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume
+          })));
+          rows = normalizeRows([...rows, ...freshTail]);
+          if (rows.length > lim) rows = rows.slice(-lim);
+        }
+      } catch(e) { /* если Binance временно не ответил — оставляем БД */ }
+    }
+
     // Заполняем внутренние пропуски синхронно и перечитываем
     if (['1m','5m','15m','1h'].includes(interval) && rows.length > 1) {
       const result = await fillGaps(symbol, interval, rows);
       if (result === null) {
         rows = fetchRows();
         rows.reverse();
+        rows = normalizeRows(rows);
       }
     }
 
-    res.json(rows);
+    res.json(normalizeRows(rows));
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
