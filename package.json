@@ -1,16 +1,16 @@
 {
   "name": "kopibar-server",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "KopiBar Binance server with SQLite candle storage",
   "dependencies": {
+    "better-sqlite3": "^12.4.1",
     "cors": "^2.8.6",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.1.0"
   }
 }
