@@ -296,38 +296,46 @@ async function downloadFullHistory(symbol, tf) {
   return totalNew;
 }
 
-// ─── Обновление новых свечей (инкрементально) ─────────────────────────────────
+// ─── Обновление новых свечей (инкрементально, все пропуски) ───────────────────
 async function updateSymbol(symbol, tf) {
   const newest = stmtGetNewest.get('binance', symbol, tf)?.t;
-  const startTime = newest ? (newest * 1000 + 1) : null;
+  let startTime = newest ? (newest * 1000) : null; // включаем последнюю свечу чтобы перезаписать незакрытую
+  let totalNew = 0;
 
-  let qs = `symbol=${encodeURIComponent(symbol)}&interval=${TF_MAP[tf]}&limit=1000`;
-  if (startTime) qs += `&startTime=${startTime}`;
+  while (true) {
+    let qs = `symbol=${encodeURIComponent(symbol)}&interval=${TF_MAP[tf]}&limit=1000`;
+    if (startTime) qs += `&startTime=${startTime}`;
 
-  let batch;
-  try {
-    batch = await limiter.schedule(() => httpGet(`/fapi/v1/klines?${qs}`));
-  } catch(e) { return 0; }
+    let batch;
+    try {
+      batch = await limiter.schedule(() => httpGet(`/fapi/v1/klines?${qs}`));
+    } catch(e) { break; }
 
-  if (!Array.isArray(batch) || batch.length === 0) return 0;
+    if (!Array.isArray(batch) || batch.length === 0) break;
 
-  const rows = batch.map(c => ({
-    exchange:'binance', symbol, tf,
-    time: Math.floor(c[0]/1000), open: parseFloat(c[1]),
-    high: parseFloat(c[2]), low: parseFloat(c[3]),
-    close: parseFloat(c[4]), volume: parseFloat(c[5])
-  }));
-  insertMany(rows);
+    const rows = batch.map(c => ({
+      exchange:'binance', symbol, tf,
+      time: Math.floor(c[0]/1000), open: parseFloat(c[1]),
+      high: parseFloat(c[2]), low: parseFloat(c[3]),
+      close: parseFloat(c[4]), volume: parseFloat(c[5])
+    }));
+    insertMany(rows);
+    totalNew += rows.length;
 
-  // Обновляем newest_time
-  const newNewest = stmtGetNewest.get('binance', symbol, tf)?.t;
-  const oldest    = stmtGetOldest.get('binance', symbol, tf)?.t;
-  const state     = stmtGetState.get('binance', symbol, tf);
-  stmtSetState.run({ exchange:'binance', symbol, tf,
-    oldest_time: oldest, newest_time: newNewest,
-    full_loaded: state?.full_loaded || 0 });
+    if (batch.length < 1000) break;
+    startTime = batch[batch.length - 1][0] + 1;
+  }
 
-  return rows.length;
+  if (totalNew > 0) {
+    const newNewest = stmtGetNewest.get('binance', symbol, tf)?.t;
+    const oldest    = stmtGetOldest.get('binance', symbol, tf)?.t;
+    const state     = stmtGetState.get('binance', symbol, tf);
+    stmtSetState.run({ exchange:'binance', symbol, tf,
+      oldest_time: oldest, newest_time: newNewest,
+      full_loaded: state?.full_loaded || 0 });
+  }
+
+  return totalNew;
 }
 
 // ─── Мета-кэш (символы и тикеры) ─────────────────────────────────────────────
@@ -564,7 +572,80 @@ async function runStatsUpdater() {
 
 // ─── Роуты ───────────────────────────────────────────────────────────────────
 
-// GET /stats?tf=5m — статистика всех монет (NATR/волат/корр)
+// POST /redownload?symbol=BRUSDT — полная перекачка одной монеты
+app.post('/redownload', async (req, res) => {
+  const { symbol } = req.query;
+  if (!symbol) return res.status(400).json({ error: 'Нужен symbol' });
+  res.json({ ok: true, message: `Перекачка ${symbol} запущена, смотри логи` });
+
+  console.log(`[redownload] Удаляем старые данные ${symbol}...`);
+  for (const tf of ['1m','5m','15m','1h','4h','1d']) {
+    db.prepare(`DELETE FROM candles WHERE exchange='binance' AND symbol=? AND tf=?`).run(symbol, tf);
+    db.prepare(`DELETE FROM download_state WHERE exchange='binance' AND symbol=? AND tf=?`).run(symbol, tf);
+  }
+  console.log(`[redownload] Данные удалены, начинаем загрузку...`);
+  try {
+    await downloadSymbol(symbol);
+    console.log(`[redownload] ✅ ${symbol} перекачан`);
+  } catch(e) {
+    console.error(`[redownload] ❌ Ошибка: ${e.message}`);
+  }
+});
+
+// POST /fix-gaps — одноразовое заполнение всех пропусков в БД
+let fixGapsRunning = false;
+app.post('/fix-gaps', async (req, res) => {
+  if (fixGapsRunning) return res.json({ ok: false, message: 'Уже запущено' });
+  res.json({ ok: true, message: 'Запущено в фоне, смотри логи' });
+
+  fixGapsRunning = true;
+  const meta = await getMeta().catch(() => ({ symbols: [] }));
+  console.log(`[fix-gaps] Начинаю проверку ${meta.symbols.length} монет...`);
+
+  for (const symbol of meta.symbols) {
+    for (const tf of ['1m','5m','15m','1h']) {
+      try {
+        const rows = db.prepare(`
+          SELECT time, (time*1000) as openTime
+          FROM candles WHERE exchange='binance' AND symbol=? AND tf=?
+          ORDER BY time ASC
+        `).all(symbol, tf);
+        if (rows.length < 2) continue;
+
+        const step = TF_STEP_SEC[tf];
+        const tolerance = step * 1.5;
+        let hadGaps = false;
+
+        for (let i = 1; i < rows.length; i++) {
+          const diff = rows[i].time - rows[i-1].time;
+          if (diff <= tolerance) continue;
+          hadGaps = true;
+          try {
+            const startTime = (rows[i-1].time + step) * 1000;
+            const endTime   = (rows[i].time - 1) * 1000;
+            const qs = `symbol=${encodeURIComponent(symbol)}&interval=${TF_MAP[tf]}&startTime=${startTime}&endTime=${endTime}&limit=1000`;
+            const data = await limiter.schedule(() => httpGet(`/fapi/v1/klines?${qs}`));
+            if (!Array.isArray(data) || data.length === 0) continue;
+            const newRows = data.map(c => ({
+              exchange:'binance', symbol, tf,
+              time: Math.floor(c[0]/1000), open: parseFloat(c[1]),
+              high: parseFloat(c[2]), low: parseFloat(c[3]),
+              close: parseFloat(c[4]), volume: parseFloat(c[5])
+            }));
+            insertMany(newRows);
+            console.log(`[fix-gaps] ${symbol} ${tf}: +${newRows.length} свечей`);
+          } catch(e) { /* пропускаем */ }
+          await sleep(50);
+        }
+      } catch(e) { /* пропускаем монету */ }
+    }
+  }
+
+  console.log('[fix-gaps] ✅ Готово!');
+  fixGapsRunning = false;
+});
+
+
 app.get('/stats', async (req, res) => {
   const tf = req.query.tf || '5m';
   if (statsCache[tf] && statsCache[tf].data) {
@@ -580,6 +661,7 @@ app.get('/stats', async (req, res) => {
 });
 
 
+app.get('/ping', (req, res) => {
   const dbSize = (() => {
     try {
       const stat = fs.statSync(path.join(DATA_DIR, 'candles.db'));
@@ -599,7 +681,7 @@ app.get('/stats', async (req, res) => {
     },
     dbSize
   });
-
+});
 
 // Статус загрузки
 app.get('/download-status', (req, res) => {
@@ -729,13 +811,16 @@ app.get('/klines', async (req, res) => {
       }
     }
 
-    // Отдаём данные сразу — не ждём заполнения внутренних пропусков
-    res.json(rows);
-
-    // Заполняем внутренние пропуски в фоне (не блокируем ответ клиенту)
+    // Заполняем внутренние пропуски синхронно и перечитываем
     if (['1m','5m','15m','1h'].includes(interval) && rows.length > 1) {
-      fillGaps(symbol, interval, rows).catch(() => {});
+      const result = await fillGaps(symbol, interval, rows);
+      if (result === null) {
+        rows = fetchRows();
+        rows.reverse();
+      }
     }
+
+    res.json(rows);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
